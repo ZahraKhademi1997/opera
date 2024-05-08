@@ -1,7 +1,8 @@
 # Copyright (c) Hikvision Research Institute. All rights reserved.
 import copy
 import warnings
-
+import numpy as np
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +19,7 @@ from mmdet.models.dense_heads.detr_head import DETRHead
 
 from opera.models.utils import build_positional_encoding
 from ..builder import HEADS
+import datetime
 
 
 @HEADS.register_module()
@@ -204,6 +206,7 @@ class SOITHead(DETRHead):
 
         mlvl_masks = []
         mlvl_positional_encodings = []
+        # print('mlvl_feats:', mlvl_feats)
         for feat in mlvl_feats:
             mlvl_masks.append(
                 F.interpolate(img_masks[None],
@@ -215,7 +218,7 @@ class SOITHead(DETRHead):
             img_masks[None],
             size=mlvl_feats[0].shape[-2:]).to(torch.bool).squeeze(0)
         self.p3_mask = p3_mask
-
+        # print('self.p3_mask shape:', self.p3_mask.shape) #torch.Size([2, 88, 117])
         query_embeds = None
         if not self.as_two_stage:
             query_embeds = self.query_embedding.weight
@@ -231,6 +234,10 @@ class SOITHead(DETRHead):
                     cls_branches=self.cls_branches \
                         if self.as_two_stage else None  # noqa:E501
             )
+                
+        # print('hs shape:', hs.shape)
+        # print('init_reference shape:', init_reference.shape)
+        # print('inter_references shape:', inter_references.shape)
         hs = hs.permute(0, 2, 1, 3)
         outputs_classes = []
         outputs_coords = []
@@ -258,6 +265,10 @@ class SOITHead(DETRHead):
         outputs_classes = torch.stack(outputs_classes)
         outputs_coords = torch.stack(outputs_coords)
         outputs_dynamic_params = torch.stack(outputs_dynamic_params)
+        
+        # print('outputs_classes shape:', outputs_classes.shape)
+        # print('outputs_coords shape;', outputs_coords.shape)
+        # print('outputs_dynamic_params shape;', outputs_dynamic_params.shape)
         if self.as_two_stage:
             return outputs_classes, outputs_coords, \
                 enc_outputs_class, \
@@ -379,9 +390,28 @@ class SOITHead(DETRHead):
                          img_metas,
                          gt_bboxes_ignore_list,
                          mask_proto=None):
+        
+        # Define a function to plot and compare masks
+        def plot_masks(gt_mask, pred_mask, index, output_dir):
+            fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+            ax[0].imshow(gt_mask, cmap='gray')
+            ax[0].title.set_text('Ground Truth Mask')
+            ax[0].axis('off')
+            
+            ax[1].imshow(pred_mask, cmap='gray')
+            ax[1].title.set_text('Predicted Mask')
+            ax[1].axis('off')
+            
+            # Save the plot with a unique name to avoid overwriting
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            plt.savefig(f"{output_dir}/mask_comparison_{index}_{timestamp}.png")
+            plt.close()
+    
+    
         (seg_memory, seg_pos_embed, seg_mask, spatial_shapes,
         seg_reference_points, level_start_index, valid_ratios) = mask_proto
         num_imgs = cls_scores.size(0)
+        print('num_imgs:', num_imgs)
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
         cls_reg_targets = self.get_targets_mask(cls_scores_list, bbox_preds_list,
@@ -392,6 +422,7 @@ class SOITHead(DETRHead):
 
         num_total_pos = cls_scores.new_tensor([num_total_pos])
         num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
+        print('num_total_pos:', num_total_pos)
 
         gt_masks_list = [gt_masks.masks for gt_masks in gt_masks_list]
         input_h, input_w = img_metas[0]['batch_input_shape']
@@ -404,19 +435,30 @@ class SOITHead(DETRHead):
                     (seg_memory.new_tensor(gt_masks_list[i]))
             gt_inds = gt_inds_list[i]
             pos_ind = gt_inds > 0
+            # print('pos_ind:', pos_ind)
             gt_masks = gt_masks[gt_inds[pos_ind] - 1]
             mask_preds = []
             pos_dynamic_params = dynamic_params[i][pos_ind]
+            # print('pos_dynamic_params in loss:', pos_dynamic_params.shape)
             pos_bbox_preds = bbox_preds[i][pos_ind].detach()
+            # print('pos_bbox_preds in loss:', pos_bbox_preds.shape)
             pos_cxcy_coord = pos_bbox_preds[:, :2]
+            # print('pos_cxcy_coord in loss:', pos_cxcy_coord.shape)
             img_mask = self.p3_mask[[i]]
+            # print('pos_dynamic_params.size(0):', pos_dynamic_params.size(0))
 
             if pos_dynamic_params.size(0) > 0:
                 for j in range(pos_dynamic_params.size(0)):
                     seg_pos_embed = self.mask_positional_encoding(
                         img_mask, pos_cxcy_coord[j])
+                    print('seg_pos_embed before:', seg_pos_embed.shape)
                     seg_pos_embed = seg_pos_embed.flatten(2).transpose(
                         1, 2).permute(1, 0, 2)
+                    # print('seg_pos_embed after:', seg_pos_embed.shape)
+                    # print('pos_dynamic_params[j]:', pos_dynamic_params[j].shape)
+                    # print('seg_memory[:, [i], :]: ', seg_memory[:, [i], :].shape)
+                    # print('seg_mask[[i]]:', seg_mask[[i]].shape)
+                    # print('seg_reference_points[[i]]:', seg_reference_points[[i]].shape)
                     mask_preds.append(self.dynamic_encoder(
                         pos_dynamic_params[j],
                         seg_memory[:, [i], :],
@@ -431,6 +473,7 @@ class SOITHead(DETRHead):
                 mask_preds = [
                     mask.squeeze().reshape(h, w) for mask in mask_preds]
                 mask_preds = torch.stack(mask_preds)
+                # print('mask_preds initially:', mask_preds.shape)
                 pad_mask = seg_mask[i].reshape(1, 1, h, w).float()
                 pad_mask = F.interpolate(
                     pad_mask,
@@ -451,6 +494,14 @@ class SOITHead(DETRHead):
                     mask_preds,
                     mask_targets,
                     reduction='none').sum() / (~pad_mask).sum()
+                
+                # Plot and save the masks for each image
+                output_directory = '/home/zahra/Documents/Projects/prototype/MOTR-codes/DataModelPaper/Auxilary_codes/soit_model/output/vis'
+                gt_mask_numpy = mask_targets.cpu().numpy()
+                pred_mask_numpy = mask_preds.cpu().detach().numpy()
+                for k in range(pred_mask_numpy.shape[0]):  # Loop through all masks
+                    plot_masks(gt_mask_numpy[k], pred_mask_numpy[k], k, output_directory)
+            
             else:
                 loss_mask_dice += (pos_dynamic_params.sum() * 
                     seg_memory[:, i, :].sum() * seg_pos_embed.sum())
